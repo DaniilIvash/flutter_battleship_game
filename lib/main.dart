@@ -1,8 +1,10 @@
 // main.dart
+import 'dart:isolate';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -50,7 +52,10 @@ class GameStatsService {
     try {
       final file = await _getStatsFile();
       if (await file.exists()) {
-        final jsonData = await file.readAsString();
+        final jsonData = await _runInIsolate<String, String>(
+          _readFileInIsolate,
+          file.path,
+        );
         final List<dynamic> statsList = jsonDecode(jsonData)['games'];
         return statsList.map((stat) => GameStats.fromJson(stat)).toList();
       }
@@ -63,9 +68,65 @@ class GameStatsService {
   Future<void> saveStats(List<GameStats> stats) async {
     final file = await _getStatsFile();
     final jsonData = jsonEncode({'games': stats.map((stat) => stat.toJson()).toList()});
-    await file.writeAsString(jsonData);
+    await _runInIsolate<Map<String, String>, void>(
+      _writeFileInIsolate,
+      {'path': file.path, 'data': jsonData},
+    );
+  }
+
+  // Универсальный метод для запуска функций в изоляте
+  Future<TResult> _runInIsolate<TParam, TResult>(
+    FutureOr<TResult> Function(TParam) callback,
+    TParam parameter,
+  ) async {
+    final receivePort = ReceivePort();
+    try {
+      final isolate = await Isolate.spawn(
+        _isolateEntryPoint,
+        _IsolateMessage<TParam, TResult>(callback, parameter, receivePort.sendPort),
+      );
+      final result = await receivePort.first;
+      isolate.kill();
+      return result as TResult;
+    } finally {
+      receivePort.close();
+    }
   }
 }
+
+// Класс для передачи сообщений в изолят
+class _IsolateMessage<TParam, TResult> {
+  final FutureOr<TResult> Function(TParam) callback;
+  final TParam parameter;
+  final SendPort sendPort;
+
+  _IsolateMessage(this.callback, this.parameter, this.sendPort);
+}
+
+// Точка входа для изолята
+void _isolateEntryPoint(_IsolateMessage message) async {
+  try {
+    final result = await message.callback(message.parameter);
+    message.sendPort.send(result);
+  } catch (e) {
+    message.sendPort.send(e);
+  }
+}
+
+// Функция для чтения файла в изоляте (остаётся без изменений)
+String _readFileInIsolate(String filePath) {
+  final file = File(filePath);
+  return file.readAsStringSync();
+}
+
+// Функция для записи файла в изоляте (остаётся без изменений)
+void _writeFileInIsolate(Map<String, String> params) {
+  final filePath = params['path']!;
+  final data = params['data']!;
+  final file = File(filePath);
+  file.writeAsStringSync(data);
+}
+
 
 // Логика игры
 class GameLogic {
@@ -469,16 +530,29 @@ class _MainScreenState extends State<MainScreen> {
               if (!isPlacingShips)
                 ElevatedButton(
                   onPressed: () async {
-                    await gameLogic.saveGameResult(
-                      gameStatus.contains('победил') ? gameStatus.split(' ')[0] : 'Ничья',
-                      moves,
-                    );
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Результат сохранён!')),
+                    final stats = await gameLogic.statsService.readStats();
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => StatsScreen(stats: stats),
+                      ),
                     );
                   },
-                  child: const Text('Сохранить результат'),
+                  child: const Text('Посмотреть статистику'),
                 ),
+              ElevatedButton(
+                onPressed: () async {
+                  await gameLogic.saveGameResult(
+                    gameStatus.contains('победил') ? gameStatus.split(' ')[0] : 'Ничья',
+                    moves,
+                  );
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Результат сохранён!')),
+                  );
+                },
+                child: const Text('Сохранить результат'),
+              ),
+
               if (gameStatus == 'Выберите режим игры')
                 Column(
                   children: [
@@ -511,6 +585,48 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 }
+
+// Экран просмотра статистики
+class StatsScreen extends StatelessWidget {
+  final List<GameStats> stats;
+
+  const StatsScreen({Key? key, required this.stats}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('История игр')),
+      body: ListView.builder(
+        itemCount: stats.length,
+        itemBuilder: (context, index) {
+          final stat = stats[index];
+          return Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Победитель: ${stat.winner}', style: const TextStyle(fontSize: 16)),
+                  Text('Ходы: ${stat.moves}', style: const TextStyle(fontSize: 14, color: Colors.grey)),
+                  Text('Дата: ${DateTime.parse(stat.date).toLocal().formatDate()}', style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+// Вспомогательный метод для форматирования даты
+extension DateFormat on DateTime {
+  String formatDate() {
+    return '${day.toString().padLeft(2, '0')}.${month.toString().padLeft(2, '0')}.$year ${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+  }
+}
+
+
 
 // Корневой виджет приложения
 class MyApp extends StatelessWidget {
